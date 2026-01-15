@@ -12,6 +12,9 @@ Datasets live in `datasets/` as `<dataset>.jsonl`. Each line is a JSON object wi
 
 Sample placeholders for every dataset are already included. Replace them with the official problems/answers when you are ready to run an evaluation.
 
+* `answer` may be a string or a number—the harness normalizes both (along with predictions) before scoring.
+* Entries may optionally expose metadata such as `id`, `unique_id`, `subject`, etc. `evaluate.py` logs the IDs and **prefers** a `question` field when present (falling back to `problem`). This allows datasets like AIME-24 (where `problem` stores extra commentary) to expose the true prompt separately.
+
 ## Local Server Contract
 
 `evaluate.py` expects a local HTTP endpoint capable of returning model answers.

@@ -10,15 +10,13 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import pathlib
 import sys
 import time
-import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Sequence
+from typing import Dict, List, Optional, Sequence
 
 
 DEFAULT_DATASETS = ("math500", "aime-24", "aime-25")
@@ -54,7 +52,7 @@ def parse_extra_fields(pairs: Sequence[str]) -> Dict[str, str]:
     return extra
 
 
-def load_jsonl(path: pathlib.Path) -> List[Dict[str, str]]:
+def load_jsonl(path: pathlib.Path) -> List[Dict[str, object]]:
     if not path.exists():
         raise FileNotFoundError(f"Dataset file {path} does not exist.")
     records = []
@@ -76,11 +74,11 @@ def load_jsonl(path: pathlib.Path) -> List[Dict[str, str]]:
     return records
 
 
-def normalize_answer(answer: str) -> str:
+def normalize_answer(answer: object) -> str:
     """Keep a lightweight normalization to compare math answers."""
     if answer is None:
         return ""
-    text = answer.strip()
+    text = str(answer).strip()
     if not text:
         return ""
 
@@ -97,6 +95,20 @@ def normalize_answer(answer: str) -> str:
     text = text.replace(" ", "").replace("\n", "")
     text = text.strip()
     return text.lower()
+
+
+def extract_prompt(record: Dict[str, object]) -> str:
+    prompt = record.get("question") or record.get("problem")
+    if not prompt:
+        raise KeyError("Dataset entry is missing 'problem' or 'question'.")
+    return str(prompt)
+
+
+def extract_problem_id(record: Dict[str, object]) -> Optional[str]:
+    value = record.get("unique_id") or record.get("id")
+    if value is None:
+        return None
+    return str(value)
 
 
 @dataclass
@@ -171,15 +183,16 @@ def evaluate_problem(
     dataset_name: str,
     total: int,
     idx: int,
-    item: Dict[str, str],
+    item: Dict[str, object],
     client: LocalServerClient,
     response_field: str,
     num_samples: int,
     pass_k_values: Sequence[int],
     request_interval: float,
 ) -> Dict[str, object]:
-    prompt = item["problem"]
+    prompt = extract_prompt(item)
     gold = normalize_answer(item["answer"])
+    problem_id = extract_problem_id(item)
     samples: List[str] = []
 
     for sample_id in range(num_samples):
@@ -196,8 +209,9 @@ def evaluate_problem(
 
     top1_flag = outcome.top1_correct()
     pass_hits = {k: int(outcome.pass_at_k(k)) for k in pass_k_values}
+    id_suffix = f"#{problem_id}" if problem_id else ""
     logline = (
-        f"[{dataset_name}] Problem {idx}/{total}: "
+        f"[{dataset_name}{id_suffix}] Problem {idx}/{total}: "
         f"top1={'correct' if top1_flag else 'incorrect'}"
     )
 
@@ -206,7 +220,7 @@ def evaluate_problem(
 
 def evaluate_dataset(
     dataset_name: str,
-    records: Sequence[Dict[str, str]],
+    records: Sequence[Dict[str, object]],
     client: LocalServerClient,
     response_field: str,
     num_samples: int,
@@ -221,7 +235,7 @@ def evaluate_dataset(
     top1_correct = 0
     pass_k_hits = {k: 0 for k in pass_k_values}
 
-    def run(idx: int, item: Dict[str, str]) -> Dict[str, object]:
+    def run(idx: int, item: Dict[str, object]) -> Dict[str, object]:
         return evaluate_problem(
             dataset_name=dataset_name,
             total=total,
