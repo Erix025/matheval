@@ -10,13 +10,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import sys
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 
 DEFAULT_DATASETS = ("math500", "aime-24", "aime-25")
@@ -50,6 +51,21 @@ def parse_extra_fields(pairs: Sequence[str]) -> Dict[str, str]:
             raise ValueError(f"Invalid key in --extra-field entry '{pair}'.")
         extra[key] = value
     return extra
+
+
+def coerce_extra_value(raw: str) -> object:
+    """Convert CLI-provided values into JSON-compatible Python objects."""
+    stripped = raw.strip()
+    if not stripped:
+        return ""
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return raw
+
+
+def coerce_extra_fields(extra: Dict[str, str]) -> Dict[str, object]:
+    return {key: coerce_extra_value(value) for key, value in extra.items()}
 
 
 def load_jsonl(path: pathlib.Path) -> List[Dict[str, object]]:
@@ -111,6 +127,66 @@ def extract_problem_id(record: Dict[str, object]) -> Optional[str]:
     return str(value)
 
 
+def build_openai_chat_url(base_url: str) -> str:
+    base = base_url.rstrip("/")
+    if not base:
+        raise ValueError("OpenAI backend requires a non-empty --server-url.")
+    suffix = "chat/completions"
+    if base.endswith(suffix):
+        return base
+    if base.endswith("v1"):
+        return f"{base}/{suffix}"
+    return f"{base}/v1/{suffix}"
+
+
+def build_sglang_generate_url(base_url: str) -> str:
+    base = base_url.rstrip("/")
+    if not base:
+        raise ValueError("SGLang backend requires a non-empty --server-url.")
+    if base.endswith("generate"):
+        return base
+    return f"{base}/generate"
+
+
+def post_json_with_retries(
+    url: str,
+    payload: Dict[str, object],
+    timeout: float,
+    max_retries: int,
+    retry_delay: float,
+    headers: Optional[Dict[str, str]] = None,
+) -> Dict[str, object]:
+    data = json.dumps(payload).encode("utf-8")
+    attempt = 0
+    final_headers = {"Content-Type": "application/json"}
+    if headers:
+        final_headers.update(headers)
+
+    while True:
+        try:
+            req = urllib.request.Request(
+                url,
+                data=data,
+                headers=final_headers,
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                content_type = response.headers.get("Content-Type", "")
+                body = response.read()
+            if "application/json" not in content_type:
+                raise ValueError(
+                    f"Expected JSON response but received Content-Type '{content_type}'."
+                )
+            return json.loads(body.decode("utf-8"))
+        except Exception as exc:  # noqa: BLE001 - propagate network issues after retries.
+            attempt += 1
+            if attempt > max_retries:
+                raise RuntimeError(
+                    f"Request to {url} failed after {max_retries} retries."
+                ) from exc
+            time.sleep(retry_delay)
+
+
 @dataclass
 class SampleOutcome:
     samples: List[str]
@@ -124,7 +200,12 @@ class SampleOutcome:
         return any(pred == self.gold for pred in self.normalized[:k])
 
 
-class LocalServerClient:
+class BackendClient:
+    def generate(self, dataset: str, prompt: str, sample_id: int) -> str:
+        raise NotImplementedError
+
+
+class CustomServerBackend(BackendClient):
     def __init__(
         self,
         url: str,
@@ -132,51 +213,181 @@ class LocalServerClient:
         max_retries: int,
         retry_delay: float,
         extra_fields: Dict[str, str],
+        response_field: str,
     ) -> None:
         self.url = url
         self.timeout = timeout
         self.max_retries = max_retries
         self.retry_delay = retry_delay
         self.extra_fields = extra_fields
+        self.response_field = response_field
 
-    def generate(
-        self,
-        dataset: str,
-        prompt: str,
-        sample_id: int,
-    ) -> Dict[str, str]:
-        payload = {
+    def generate(self, dataset: str, prompt: str, sample_id: int) -> str:
+        payload: Dict[str, object] = {
             "dataset": dataset,
             "prompt": prompt,
             "sample_id": sample_id,
         }
         payload.update(self.extra_fields)
-        data = json.dumps(payload).encode("utf-8")
+        response = post_json_with_retries(
+            url=self.url,
+            payload=payload,
+            timeout=self.timeout,
+            max_retries=self.max_retries,
+            retry_delay=self.retry_delay,
+        )
+        if self.response_field not in response:
+            raise KeyError(f"Response is missing '{self.response_field}' field: {response}")
+        return str(response[self.response_field])
 
-        attempt = 0
-        while True:
-            try:
-                req = urllib.request.Request(
-                    self.url,
-                    data=data,
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                with urllib.request.urlopen(req, timeout=self.timeout) as response:
-                    content_type = response.headers.get("Content-Type", "")
-                    body = response.read()
-                if "application/json" not in content_type:
-                    raise ValueError(
-                        f"Expected JSON response but received Content-Type '{content_type}'."
-                    )
-                return json.loads(body.decode("utf-8"))
-            except Exception as exc:  # noqa: BLE001 - we want to catch network errors.
-                attempt += 1
-                if attempt > self.max_retries:
-                    raise RuntimeError(
-                        f"Local server request failed after {self.max_retries} retries."
-                    ) from exc
-                time.sleep(self.retry_delay)
+
+class OpenAIBackend(BackendClient):
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        model: str,
+        timeout: float,
+        max_retries: int,
+        retry_delay: float,
+        extra_fields: Dict[str, object],
+        system_prompt: Optional[str],
+    ) -> None:
+        self.url = build_openai_chat_url(base_url)
+        self.api_key = api_key
+        self.model = model
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
+        self.extra_fields = extra_fields
+        self.system_prompt = system_prompt
+
+    def generate(self, dataset: str, prompt: str, sample_id: int) -> str:
+        messages: List[Dict[str, str]] = []
+        if self.system_prompt:
+            messages.append({"role": "system", "content": self.system_prompt})
+        messages.append({"role": "user", "content": prompt})
+        payload: Dict[str, object] = {
+            "model": self.model,
+            "messages": messages,
+        }
+        payload.update(self.extra_fields)
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        response = post_json_with_retries(
+            url=self.url,
+            payload=payload,
+            timeout=self.timeout,
+            max_retries=self.max_retries,
+            retry_delay=self.retry_delay,
+            headers=headers,
+        )
+        choices = response.get("choices")
+        if not choices:
+            raise KeyError(f"OpenAI response missing 'choices': {response}")
+        choice0 = choices[0]
+        message = choice0.get("message")
+        if isinstance(message, dict) and message.get("content"):
+            return str(message["content"])
+        if "text" in choice0:
+            return str(choice0["text"])
+        raise KeyError(f"OpenAI choice missing content: {choice0}")
+
+
+class SGLangBackend(BackendClient):
+    def __init__(
+        self,
+        base_url: str,
+        timeout: float,
+        max_retries: int,
+        retry_delay: float,
+        sampling_params: Dict[str, object],
+        api_key: Optional[str],
+    ) -> None:
+        self.url = build_sglang_generate_url(base_url)
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
+        self.sampling_params = sampling_params
+        self.api_key = api_key
+
+    def generate(self, dataset: str, prompt: str, sample_id: int) -> str:
+        payload = {
+            "text": prompt,
+            "sampling_params": dict(self.sampling_params),
+        }
+        headers = {}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        response = post_json_with_retries(
+            url=self.url,
+            payload=payload,
+            timeout=self.timeout,
+            max_retries=self.max_retries,
+            retry_delay=self.retry_delay,
+            headers=headers,
+        )
+        if "text" not in response:
+            raise KeyError(f"SGLang response missing 'text': {response}")
+        return str(response["text"])
+
+
+def create_backend_client(
+    backend: str,
+    server_url: str,
+    timeout: float,
+    max_retries: int,
+    retry_delay: float,
+    extra_fields: Dict[str, str],
+    response_field: str,
+    model: Optional[str],
+    api_key: Optional[str],
+    system_prompt: Optional[str],
+) -> BackendClient:
+    if backend == "custom":
+        return CustomServerBackend(
+            url=server_url,
+            timeout=timeout,
+            max_retries=max_retries,
+            retry_delay=retry_delay,
+            extra_fields=extra_fields,
+            response_field=response_field,
+        )
+
+    if backend == "openai":
+        resolved_key = api_key or os.environ.get("OPENAI_API_KEY")
+        if not resolved_key:
+            raise ValueError(
+                "OpenAI backend requires an API key via --api-key or OPENAI_API_KEY."
+            )
+        if not model:
+            raise ValueError("OpenAI backend requires --model to be specified.")
+        typed_extra = coerce_extra_fields(extra_fields)
+        return OpenAIBackend(
+            base_url=server_url,
+            api_key=resolved_key,
+            model=model,
+            timeout=timeout,
+            max_retries=max_retries,
+            retry_delay=retry_delay,
+            extra_fields=typed_extra,
+            system_prompt=system_prompt,
+        )
+
+    if backend == "sglang":
+        typed_sampling = coerce_extra_fields(extra_fields)
+        resolved_key = api_key or os.environ.get("SGLANG_API_KEY") or os.environ.get(
+            "OPENAI_API_KEY"
+        )
+        return SGLangBackend(
+            base_url=server_url,
+            timeout=timeout,
+            max_retries=max_retries,
+            retry_delay=retry_delay,
+            sampling_params=typed_sampling,
+            api_key=resolved_key,
+        )
+
+    raise ValueError(f"Unsupported backend '{backend}'.")
 
 
 def evaluate_problem(
@@ -184,8 +395,7 @@ def evaluate_problem(
     total: int,
     idx: int,
     item: Dict[str, object],
-    client: LocalServerClient,
-    response_field: str,
+    client: BackendClient,
     num_samples: int,
     pass_k_values: Sequence[int],
     request_interval: float,
@@ -196,10 +406,7 @@ def evaluate_problem(
     samples: List[str] = []
 
     for sample_id in range(num_samples):
-        response = client.generate(dataset_name, prompt, sample_id)
-        if response_field not in response:
-            raise KeyError(f"Response is missing '{response_field}' field: {response}")
-        prediction = response[response_field]
+        prediction = client.generate(dataset_name, prompt, sample_id)
         samples.append(prediction)
         if request_interval > 0 and sample_id != num_samples - 1:
             time.sleep(request_interval)
@@ -221,8 +428,7 @@ def evaluate_problem(
 def evaluate_dataset(
     dataset_name: str,
     records: Sequence[Dict[str, object]],
-    client: LocalServerClient,
-    response_field: str,
+    client: BackendClient,
     num_samples: int,
     pass_k_values: Sequence[int],
     request_interval: float,
@@ -242,7 +448,6 @@ def evaluate_dataset(
             idx=idx,
             item=item,
             client=client,
-            response_field=response_field,
             num_samples=num_samples,
             pass_k_values=pass_k_values,
             request_interval=request_interval,
@@ -296,9 +501,27 @@ def main(argv: Sequence[str]) -> int:
         help="Local server URL that accepts POST requests with JSON payloads.",
     )
     parser.add_argument(
+        "--backend",
+        choices=["custom", "openai", "sglang"],
+        default="custom",
+        help="Backend type to query: a custom local server, an OpenAI-compatible server, or the native SGLang /generate endpoint.",
+    )
+    parser.add_argument(
+        "--model",
+        help="Model name for OpenAI-compatible backends.",
+    )
+    parser.add_argument(
         "--response-field",
         default="answer",
-        help="JSON field in the server response that holds the model answer.",
+        help="JSON field in the custom backend response that holds the model answer.",
+    )
+    parser.add_argument(
+        "--api-key",
+        help="API key for OpenAI/SGLang servers. Falls back to the OPENAI_API_KEY or SGLANG_API_KEY environment variables.",
+    )
+    parser.add_argument(
+        "--system-prompt",
+        help="Optional system prompt inserted before every user query for OpenAI-compatible backends.",
     )
     parser.add_argument(
         "--num-samples",
@@ -363,12 +586,17 @@ def main(argv: Sequence[str]) -> int:
 
     extra_fields = parse_extra_fields(args.extra_field)
 
-    client = LocalServerClient(
-        url=args.server_url,
+    client = create_backend_client(
+        backend=args.backend,
+        server_url=args.server_url,
         timeout=args.request_timeout,
         max_retries=args.max_retries,
         retry_delay=args.retry_delay,
         extra_fields=extra_fields,
+        response_field=args.response_field,
+        model=args.model,
+        api_key=args.api_key,
+        system_prompt=args.system_prompt,
     )
 
     overall_metrics: Dict[str, List[float]] = {}
@@ -379,7 +607,6 @@ def main(argv: Sequence[str]) -> int:
             dataset_name=dataset,
             records=records,
             client=client,
-            response_field=args.response_field,
             num_samples=args.num_samples,
             pass_k_values=pass_k_values,
             request_interval=args.request_interval,

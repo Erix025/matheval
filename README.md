@@ -25,6 +25,26 @@ Sample placeholders for every dataset are already included. Replace them with th
 
 You can wrap any inference stack with a small Flask/FastAPI server that adheres to the contract above.
 
+## Supported Backends
+
+`evaluate.py` now understands three request styles:
+
+1. **Custom server** (`--backend custom`, default): identical to the original contract above.
+2. **OpenAI-compatible chat completions** (`--backend openai`): sends prompts via `/v1/chat/completions` as described in the [OpenAI-compatible completions guide](https://docs.sglang.io/basic_usage/openai_api_completions.html). Provide `--model`, `--api-key`/`OPENAI_API_KEY`, and optional `--system-prompt`/`--extra-field temperature=0.2 max_tokens=512`.
+3. **SGLang native `/generate` endpoint** (`--backend sglang`): posts `{"text": prompt, "sampling_params": {...}}` following the [send_request reference](https://docs.sglang.io/basic_usage/send_request.html). Attach sampling options with `--extra-field temperature=0.1 max_new_tokens=256`.
+
+Example invocations:
+
+```bash
+# OpenAI server
+python3 evaluate.py --backend openai --server-url https://api.openai.com \
+  --model gpt-4o-mini --api-key "$OPENAI_API_KEY" --datasets math500 --num-samples 2
+
+# Local SGLang runtime
+python3 evaluate.py --backend sglang --server-url http://localhost:30000 \
+  --extra-field temperature=0 --extra-field max_new_tokens=256
+```
+
 ## Running an Evaluation
 
 ```bash
