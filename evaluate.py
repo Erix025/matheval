@@ -17,7 +17,7 @@ import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
 DEFAULT_DATASETS = ("math500", "aime-24", "aime-25")
@@ -422,7 +422,19 @@ def evaluate_problem(
         f"top1={'correct' if top1_flag else 'incorrect'}"
     )
 
-    return {"top1": top1_flag, "pass_hits": pass_hits, "logline": logline}
+    record = {
+        "index": idx,
+        "problem_id": problem_id,
+        "input": prompt,
+        "outputs": samples,
+        "normalized_outputs": normalized_predictions,
+        "gold_answer": item["answer"],
+        "normalized_gold": gold,
+        "top1_correct": top1_flag,
+        "pass_hits": pass_hits,
+    }
+
+    return {"top1": top1_flag, "pass_hits": pass_hits, "logline": logline, "record": record}
 
 
 def evaluate_dataset(
@@ -433,16 +445,17 @@ def evaluate_dataset(
     pass_k_values: Sequence[int],
     request_interval: float,
     concurrency: int,
-) -> Dict[str, float]:
+) -> Tuple[Dict[str, float], List[Dict[str, object]]]:
     total = len(records)
     if not total:
         raise ValueError(f"Dataset '{dataset_name}' is empty.")
 
     top1_correct = 0
     pass_k_hits = {k: 0 for k in pass_k_values}
+    problem_records: List[Optional[Dict[str, object]]] = [None] * total
 
-    def run(idx: int, item: Dict[str, object]) -> Dict[str, object]:
-        return evaluate_problem(
+    def run(idx: int, item: Dict[str, object]) -> Tuple[int, Dict[str, object]]:
+        return idx, evaluate_problem(
             dataset_name=dataset_name,
             total=total,
             idx=idx,
@@ -455,12 +468,13 @@ def evaluate_dataset(
 
     if concurrency == 1:
         for idx, item in enumerate(records, 1):
-            result = run(idx, item)
+            current_idx, result = run(idx, item)
             if result["top1"]:
                 top1_correct += 1
             for k, hit in result["pass_hits"].items():
                 pass_k_hits[k] += hit
             print(result["logline"])
+            problem_records[current_idx - 1] = result["record"]
     else:
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
             futures = {
@@ -468,17 +482,19 @@ def evaluate_dataset(
                 for idx, item in enumerate(records, 1)
             }
             for future in as_completed(futures):
-                result = future.result()
+                current_idx, result = future.result()
                 if result["top1"]:
                     top1_correct += 1
                 for k, hit in result["pass_hits"].items():
                     pass_k_hits[k] += hit
                 print(result["logline"])
+                problem_records[current_idx - 1] = result["record"]
 
     metrics = {"accuracy": top1_correct / total}
     for k, hits in pass_k_hits.items():
         metrics[f"pass@{k}"] = hits / total
-    return metrics
+    finalized_records = [record for record in problem_records if record is not None]
+    return metrics, finalized_records
 
 
 def main(argv: Sequence[str]) -> int:
@@ -551,7 +567,7 @@ def main(argv: Sequence[str]) -> int:
     parser.add_argument(
         "--request-timeout",
         type=float,
-        default=30.0,
+        default=3000.0,
         help="Timeout (seconds) for each server request.",
     )
     parser.add_argument(
@@ -571,6 +587,12 @@ def main(argv: Sequence[str]) -> int:
         action="append",
         default=[],
         help="Additional key=value pairs to include in every request payload.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=pathlib.Path,
+        default=pathlib.Path("outputs"),
+        help="Directory where per-dataset JSON outputs (records and summary) are stored.",
     )
 
     args = parser.parse_args(argv)
@@ -600,10 +622,13 @@ def main(argv: Sequence[str]) -> int:
     )
 
     overall_metrics: Dict[str, List[float]] = {}
+    run_timestamp = time.strftime("%Y%m%d-%H%M%S")
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+
     for dataset in args.datasets:
         data_path = args.data_dir / f"{dataset}.jsonl"
         records = load_jsonl(data_path)
-        metrics = evaluate_dataset(
+        metrics, problem_records = evaluate_dataset(
             dataset_name=dataset,
             records=records,
             client=client,
@@ -612,6 +637,27 @@ def main(argv: Sequence[str]) -> int:
             request_interval=args.request_interval,
             concurrency=args.concurrency,
         )
+        dataset_output_dir = args.output_dir / f"{dataset}-{run_timestamp}"
+        dataset_output_dir.mkdir(parents=True, exist_ok=True)
+        records_path = dataset_output_dir / "records.json"
+        summary_path = dataset_output_dir / "summary.json"
+
+        with records_path.open("w", encoding="utf-8") as f:
+            json.dump(problem_records, f, ensure_ascii=False, indent=2)
+
+        summary_payload = {
+            "dataset": dataset,
+            "timestamp": run_timestamp,
+            "num_problems": len(records),
+            "num_samples": args.num_samples,
+            "backend": args.backend,
+            "server_url": args.server_url,
+            "pass_k": pass_k_values,
+            "metrics": metrics,
+        }
+        with summary_path.open("w", encoding="utf-8") as f:
+            json.dump(summary_payload, f, ensure_ascii=False, indent=2)
+
         print(f"\nDataset={dataset}")
         for key, value in metrics.items():
             print(f"  {key}: {value:.4f}")
